@@ -1,52 +1,41 @@
-use glam::Vec3A;
-use image::{DynamicImage, GenericImageView, RgbaImage};
+use glam::{Mat3A, Mat4, Vec3A};
+use image::RgbImage;
 use kd_tree::{KdPoint, KdTree};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 const TILE_SIZE: u32 = 32;
 
-fn srgb_to_linear(mut rgb: Vec3A) -> Vec3A {
-    for i in 0..3 {
-        if rgb[i] <= 0.04045 {
-            rgb[i] /= 12.92;
-        } else {
-            rgb[i] = ((rgb[i] + 0.055) / 1.055).powf(2.4);
-        }
-    }
+const XYZ_MATRIX: Mat3A = Mat3A::from_cols_array_2d(&[
+    [0.4124564, 0.2126729, 0.0193339],
+    [0.3575761, 0.7151522, 0.119_192],
+    [0.1804375, 0.0721750, 0.9503041],
+]);
 
-    rgb
+fn srgb_to_linear(rgb: Vec3A) -> Vec3A {
+    Vec3A::select(
+        rgb.cmple(Vec3A::splat(0.04045)),
+        rgb / 12.92,
+        ((rgb + 0.055) / 1.055).powf(2.4),
+    )
 }
 
 fn rgb_to_xyz(rgb: Vec3A) -> Vec3A {
-    let x = 0.4124564 * rgb.x + 0.3575761 * rgb.y + 0.1804375 * rgb.z;
-    let y = 0.2126729 * rgb.x + 0.7151522 * rgb.y + 0.0721750 * rgb.z;
-    let z = 0.0193339 * rgb.x + 0.119_192 * rgb.y + 0.9503041 * rgb.z;
-
-    Vec3A::new(x, y, z)
+    XYZ_MATRIX * rgb
 }
 
 fn xyz_to_lab(xyz: Vec3A) -> Vec3A {
-    fn f(val: f32) -> f32 {
-        if val > 0.008856 {
-            val.cbrt()
-        } else {
-            7.787 * val + 16.0 / 116.0
-        }
+    fn f(xyz: Vec3A) -> Vec3A {
+        Vec3A::select(
+            xyz.cmpgt(Vec3A::splat(0.008856)),
+            Vec3A::new(xyz.x.cbrt(), xyz.y.cbrt(), xyz.z.cbrt()),
+            7.787 * xyz + 16.0 / 116.0,
+        )
     }
 
-    let xn = 0.95047;
-    let yn = 1.0;
-    let zn = 1.08883;
+    let n = Vec3A::new(0.95047, 1.0, 1.08883);
+    let f = f(xyz / n);
 
-    let fx = f(xyz.x / xn);
-    let fy = f(xyz.y / yn);
-    let fz = f(xyz.z / zn);
-
-    let l = 116.0 * fy - 16.0;
-    let a = 500.0 * (fx - fy);
-    let b = 200.0 * (fy - fz);
-
-    Vec3A::new(l, a, b)
+    Vec3A::new(116.0 * f.y - 16.0, 500.0 * (f.x - f.y), 200.0 * (f.y - f.z))
 }
 
 fn rgb_to_lab(rgb: Vec3A) -> Vec3A {
@@ -54,28 +43,54 @@ fn rgb_to_lab(rgb: Vec3A) -> Vec3A {
 }
 
 struct PaletteEntry {
-    image: DynamicImage,
+    image: RgbImage,
     average_color: Vec3A,
 }
 
 impl PaletteEntry {
-    pub fn new(image: DynamicImage) -> Self {
-        let mut average_color = Vec3A::ZERO;
+    pub fn average_color(image: &RgbImage) -> Vec3A {
+        let contribution = image.width() as f32 * image.height() as f32;
 
-        for (_x, _y, rgba) in image.pixels() {
-            let rgba = rgba.0.map(|i| i as f32 / 255.0);
-            let rgb = Vec3A::from_array([rgba[0], rgba[1], rgba[2]]);
-            let lab = rgb_to_lab(rgb);
+        image
+            .pixels()
+            .map(|p| {
+                let rgb = Vec3A::from_array(p.0.map(|i| i as f32 / 255.0));
+                rgb_to_lab(rgb)
+            })
+            .sum::<Vec3A>()
+            / contribution
+    }
 
-            average_color += lab / (image.width() as f32 * image.height() as f32);
-        }
+    pub fn par_average_color(image: &RgbImage) -> Vec3A {
+        let contribution = image.width() as f32 * image.height() as f32;
 
-        let image = image.resize_exact(
+        image
+            .par_pixels()
+            .map(|p| {
+                let rgb = Vec3A::from_array(p.0.map(|i| i as f32 / 255.0));
+                rgb_to_lab(rgb)
+            })
+            .reduce(|| Vec3A::ZERO, |a, b| a + b)
+            / contribution
+    }
+
+    pub fn new(image: RgbImage) -> Self {
+        let average_color = Self::par_average_color(&image);
+
+        let image = image::imageops::resize(
+            &image,
             TILE_SIZE,
             TILE_SIZE,
             image::imageops::FilterType::CatmullRom,
         );
 
+        Self {
+            image,
+            average_color,
+        }
+    }
+
+    pub fn passthrough(image: RgbImage, average_color: Vec3A) -> Self {
         Self {
             image,
             average_color,
@@ -92,20 +107,45 @@ impl KdPoint for PaletteEntry {
     }
 }
 
-fn get_tiles(image: &DynamicImage) -> (Vec<PaletteEntry>, u32, u32) {
+fn get_tiles(image: &RgbImage) -> (Vec<PaletteEntry>, u32, u32) {
+    // https://en.wikipedia.org/wiki/Ordered_dithering#Threshold_map
+    // divide by max value, subtract half of max value to get normalized
+    // bayer matrix can be transposed or rotated to the same effect
+    // let bayer4: Mat4 = Mat4::from_cols_array_2d(&[
+    //     [0.0, 8.0, 2.0, 10.0],
+    //     [12.0, 4.0, 14.0, 6.0],
+    //     [3.0, 11.0, 1.0, 9.0],
+    //     [15.0, 7.0, 13.0, 5.0],
+    // ]) / 16.0;
+
     let num_tiles_x = image.width() / TILE_SIZE;
     let num_tiles_y = image.height() / TILE_SIZE;
 
-    let mut tiles = Vec::with_capacity((num_tiles_x * num_tiles_y) as usize);
+    let tiles: Vec<_> = (0..(num_tiles_x * num_tiles_y))
+        .into_par_iter()
+        .map(|i| {
+            let tile_y = i / num_tiles_x;
+            let tile_x = i % num_tiles_x;
 
-    for tile_y in 0..num_tiles_y {
-        for tile_x in 0..num_tiles_x {
-            let tile = image.crop_imm(tile_x * TILE_SIZE, tile_y * TILE_SIZE, TILE_SIZE, TILE_SIZE);
+            let tile = image::imageops::crop_imm(
+                image,
+                tile_x * TILE_SIZE,
+                tile_y * TILE_SIZE,
+                TILE_SIZE,
+                TILE_SIZE,
+            )
+            .to_image();
 
-            let palette_entry = PaletteEntry::new(tile);
-            tiles.push(palette_entry);
-        }
-    }
+            let bayer_x = tile_x % 4;
+            let bayer_y = tile_y % 4;
+
+            // let dither = bayer4.col(bayer_x as usize)[bayer_y as usize] - 0.5;
+
+            let average_color = PaletteEntry::average_color(&tile);
+
+            PaletteEntry::passthrough(tile, average_color)
+        })
+        .collect();
 
     (tiles, num_tiles_x, num_tiles_y)
 }
@@ -125,8 +165,11 @@ fn main() {
             .collect();
     let palette_paths = palette_paths.unwrap();
 
-    let palette: image::ImageResult<Vec<_>> =
-        palette_paths.into_par_iter().map(image::open).collect();
+    let palette: image::ImageResult<Vec<_>> = palette_paths
+        .into_par_iter()
+        .map(image::open)
+        .map(|i| i.map(|i| i.into_rgb8()))
+        .collect();
     let palette = palette.unwrap();
 
     println!(
@@ -148,13 +191,15 @@ fn main() {
         start.elapsed().as_secs_f64()
     );
 
-    let mut mosaic = image::open(std::env::current_dir().unwrap().join("mosaic.jpg")).unwrap();
-    mosaic = mosaic.crop_imm(
-        0,
-        0,
-        (mosaic.width() / TILE_SIZE) * TILE_SIZE,
-        (mosaic.height() / TILE_SIZE) * TILE_SIZE,
-    );
+    let mosaic = image::open(std::env::current_dir().unwrap().join("mosaic.jpg")).unwrap();
+    let mosaic = mosaic
+        .crop_imm(
+            0,
+            0,
+            (mosaic.width() / TILE_SIZE) * TILE_SIZE,
+            (mosaic.height() / TILE_SIZE) * TILE_SIZE,
+        )
+        .into_rgb8();
 
     println!(
         "({:.4} s) creating tiles & palette entries from mosaic image...",
@@ -181,7 +226,7 @@ fn main() {
         start.elapsed().as_secs_f64()
     );
 
-    let mut final_image = RgbaImage::new(mosaic.width(), mosaic.height());
+    let mut final_image = RgbImage::new(mosaic.width(), mosaic.height());
 
     for tile_y in 0..num_tiles_y {
         for tile_x in 0..num_tiles_x {
@@ -193,7 +238,7 @@ fn main() {
             for offset_y in 0..tile_image.height() {
                 for offset_x in 0..tile_image.width() {
                     final_image[(base_pixel_x + offset_x, base_pixel_y + offset_y)] =
-                        tile_image.get_pixel(offset_x, offset_y);
+                        tile_image[(offset_x, offset_y)];
                 }
             }
         }
