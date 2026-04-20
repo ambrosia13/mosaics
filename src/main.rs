@@ -1,4 +1,4 @@
-use glam::{Mat3A, Mat4, Vec3A};
+use glam::{Mat3A, Vec3A};
 use image::RgbImage;
 use kd_tree::{KdPoint, KdTree};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -136,8 +136,8 @@ fn get_tiles(image: &RgbImage) -> (Vec<PaletteEntry>, u32, u32) {
             )
             .to_image();
 
-            let bayer_x = tile_x % 4;
-            let bayer_y = tile_y % 4;
+            // let bayer_x = tile_x % 4;
+            // let bayer_y = tile_y % 4;
 
             // let dither = bayer4.col(bayer_x as usize)[bayer_y as usize] - 0.5;
 
